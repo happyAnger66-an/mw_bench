@@ -3,7 +3,7 @@
 <package format="3">
   <name>ros2_pubsub_bench</name>
   <version>0.1.0</version>
-  <description>C++ ROS2 pub/sub benchmark node with configurable topic, payload size and publish rate.</description>
+  <description>C++ ROS2 pub/sub/service/client benchmark node with configurable topic, payload size and publish/call rate.</description>
 
   <maintainer email="noreply@example.com">mw_bench</maintainer>
   <license>Apache-2.0</license>
@@ -12,6 +12,7 @@
 
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

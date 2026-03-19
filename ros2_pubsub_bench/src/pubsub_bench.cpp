@@ -1,5 +1,6 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/byte_multi_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -14,13 +15,8 @@
 namespace
 {
 using ByteMultiArray = std_msgs::msg::ByteMultiArray;
+using Trigger = std_srvs::srv::Trigger;
 constexpr size_t kHeaderSize = 16;  // 8 bytes seq + 8 bytes send_time_ns
-
-inline int64_t steady_now_ns()
-{
-  const auto now = std::chrono::steady_clock::now().time_since_epoch();
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
-}
 
 inline int64_t wall_now_ns()
 {
@@ -62,11 +58,11 @@ class PubSubBenchNode final : public rclcpp::Node
 public:
   struct Config
   {
-    std::string mode{"pub"};               // pub|sub
-    std::string topic{"/bench"};           // topic name
-    int topic_count{1};                    // number of publishers in pub mode
+    std::string mode{"pub"};               // pub|sub|srv|cli
+    std::string topic{"/bench"};           // topic / service name prefix
+    int topic_count{1};                    // number of publishers/subscribers/services/clients
     int size_bytes{1024};                  // payload size in bytes (pub)
-    double hz{100.0};                      // publish rate (pub)
+    double hz{100.0};                      // publish/call rate (pub/cli)
     int qos_depth{10};
     std::string reliability{"reliable"};   // reliable|best_effort
     int log_period_ms{1000};
@@ -83,8 +79,12 @@ public:
       setup_publisher();
     } else if (cfg_.mode == "sub") {
       setup_subscriber();
+    } else if (cfg_.mode == "srv") {
+      setup_service();
+    } else if (cfg_.mode == "cli") {
+      setup_client();
     } else {
-      RCLCPP_FATAL(get_logger(), "Invalid mode '%s' (expected pub|sub)", cfg_.mode.c_str());
+      RCLCPP_FATAL(get_logger(), "Invalid mode '%s' (expected pub|sub|srv|cli)", cfg_.mode.c_str());
       throw std::runtime_error("invalid mode");
     }
 
@@ -94,8 +94,9 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "pubsub_bench started: mode=%s topic=%s size_bytes=%d hz=%.3f qos_depth=%d reliability=%s",
-      cfg_.mode.c_str(), cfg_.topic.c_str(), cfg_.size_bytes, cfg_.hz, cfg_.qos_depth, cfg_.reliability.c_str());
+      "pubsub_bench started: mode=%s topic_prefix=%s topic_count=%d size_bytes=%d hz=%.3f qos_depth=%d reliability=%s",
+      cfg_.mode.c_str(), cfg_.topic.c_str(), cfg_.topic_count, cfg_.size_bytes,
+      cfg_.hz, cfg_.qos_depth, cfg_.reliability.c_str());
   }
 
 private:
@@ -155,6 +156,43 @@ private:
     }
   }
 
+  void setup_service()
+  {
+    services_.reserve(static_cast<size_t>(cfg_.topic_count));
+    for (int i = 0; i < cfg_.topic_count; ++i) {
+      const std::string service_name = cfg_.topic + "_" + std::to_string(i + 1);
+      auto srv = create_service<Trigger>(
+        service_name,
+        [this](const std::shared_ptr<Trigger::Request>,
+               std::shared_ptr<Trigger::Response> resp) {
+          resp->success = true;
+          resp->message = "ok";
+          sub_msgs_.fetch_add(1, std::memory_order_relaxed);
+        });
+      services_.push_back(std::move(srv));
+    }
+  }
+
+  void setup_client()
+  {
+    const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::duration<double>(1.0 / cfg_.hz));
+
+    clients_.reserve(static_cast<size_t>(cfg_.topic_count));
+    for (int i = 0; i < cfg_.topic_count; ++i) {
+      const std::string service_name = cfg_.topic + "_" + std::to_string(i + 1);
+      ClientItem item;
+      item.name = service_name;
+      item.client = create_client<Trigger>(service_name);
+      item.timer = create_wall_timer(
+        period,
+        [this, idx = static_cast<size_t>(i)]() {
+          send_request(idx);
+        });
+      clients_.push_back(std::move(item));
+    }
+  }
+
   void publish_once(size_t idx)
   {
     if (idx >= pubs_.size()) {
@@ -189,6 +227,38 @@ private:
     }
   }
 
+  void send_request(size_t idx)
+  {
+    if (idx >= clients_.size()) {
+      return;
+    }
+    auto & item = clients_[idx];
+    if (!item.client->wait_for_service(std::chrono::seconds(0))) {
+      return;
+    }
+
+    const int64_t start_ns = wall_now_ns();
+    auto req = std::make_shared<Trigger::Request>();
+    // rclcpp::Client 的回调参数是 SharedFuture，不是 Response::SharedPtr
+    using TriggerClient = rclcpp::Client<Trigger>;
+    (void)item.client->async_send_request(
+      req,
+      [this, start_ns](TriggerClient::SharedFuture future) {
+        try {
+          (void)future.get();
+        } catch (const std::exception &) {
+          return;
+        }
+        const int64_t now_ns = wall_now_ns();
+        const int64_t dt = now_ns - start_ns;
+        if (dt >= 0) {
+          sub_msgs_.fetch_add(1, std::memory_order_relaxed);
+          latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt), std::memory_order_relaxed);
+          latency_cnt_.fetch_add(1, std::memory_order_relaxed);
+        }
+      });
+  }
+
   void log_stats()
   {
     const auto now = std::chrono::steady_clock::now();
@@ -221,18 +291,46 @@ private:
       return;
     }
 
-    // sub mode
-    if (lat_cnt > 0) {
-      const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
+    if (cfg_.mode == "sub") {
+      if (lat_cnt > 0) {
+        const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
+        RCLCPP_INFO(
+          get_logger(),
+          "stats(%.2fs): sub %.1f msg/s %.1f Mb/s | latency avg %.3f ms (n=%lu)",
+          sec, sub_mps, sub_mbps, avg_ms, static_cast<unsigned long>(lat_cnt));
+      } else {
+        RCLCPP_INFO(
+          get_logger(),
+          "stats(%.2fs): sub %.1f msg/s %.1f Mb/s",
+          sec, sub_mps, sub_mbps);
+      }
+      return;
+    }
+
+    if (cfg_.mode == "srv") {
+      // service server：统计每秒请求数
       RCLCPP_INFO(
         get_logger(),
-        "stats(%.2fs): sub %.1f msg/s %.1f Mb/s | latency avg %.3f ms (n=%lu)",
-        sec, sub_mps, sub_mbps, avg_ms, static_cast<unsigned long>(lat_cnt));
-    } else {
-      RCLCPP_INFO(
-        get_logger(),
-        "stats(%.2fs): sub %.1f msg/s %.1f Mb/s",
-        sec, sub_mps, sub_mbps);
+        "stats(%.2fs): srv %.1f req/s",
+        sec, sub_mps);
+      return;
+    }
+
+    if (cfg_.mode == "cli") {
+      // client：统计调用速率和 RTT
+      if (lat_cnt > 0) {
+        const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
+        RCLCPP_INFO(
+          get_logger(),
+          "stats(%.2fs): cli %.1f calls/s | RTT avg %.3f ms (n=%lu)",
+          sec, sub_mps, avg_ms, static_cast<unsigned long>(lat_cnt));
+      } else {
+        RCLCPP_INFO(
+          get_logger(),
+          "stats(%.2fs): cli %.1f calls/s",
+          sec, sub_mps);
+      }
+      return;
     }
   }
 
@@ -251,6 +349,15 @@ private:
     uint64_t seq{0};
   };
   std::vector<PubItem> pubs_;
+  std::vector<rclcpp::Service<Trigger>::SharedPtr> services_;
+
+  struct ClientItem
+  {
+    std::string name;
+    rclcpp::Client<Trigger>::SharedPtr client;
+    rclcpp::TimerBase::SharedPtr timer;
+  };
+  std::vector<ClientItem> clients_;
 
   std::chrono::steady_clock::time_point last_log_time_{std::chrono::steady_clock::now()};
 
@@ -269,13 +376,17 @@ void print_usage()
   std::fprintf(
     stderr,
     "Usage:\n"
-    "  pubsub_bench [--mode pub|sub] --topic <name> [--topic-count <n>] [--size <bytes>] [--hz <rate>] [--qos-depth <n>] [--reliability reliable|best_effort] [--log-ms <ms>] [--ros-args ...]\n"
+    "  pubsub_bench [--mode pub|sub|srv|cli] --topic <name> [--topic-count <n>] [--size <bytes>] [--hz <rate>] [--qos-depth <n>] [--reliability reliable|best_effort] [--log-ms <ms>] [--ros-args ...]\n"
     "\n"
     "Examples:\n"
     "  # publisher\n"
     "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode pub --topic /chatter --size 1048576 --hz 100\n"
     "  # subscriber\n"
     "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode sub --topic /chatter\n"
+    "  # service server\n"
+    "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode srv --topic /bench_srv\n"
+    "  # service client\n"
+    "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode cli --topic /bench_srv --hz 50\n"
     "\n");
 }
 
@@ -355,4 +466,3 @@ int main(int argc, char ** argv)
   rclcpp::shutdown();
   return 0;
 }
-
