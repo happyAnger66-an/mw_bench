@@ -52,3 +52,15 @@ ros2 run ros2_pubsub_bench pubsub_bench -- \
 
 跨主机测试时需要两台机器的系统时间同步（如 **NTP/Chrony**），否则 `dt` 可能出现明显偏差或为负（程序会忽略负值样本）。
 
+### Action Server
+
+ros2 run ros2_pubsub_bench pubsub_bench -- \
+  --mode act_srv \
+  --topic /bench_action
+# 提供 /bench_action 这个 Fibonacci action
+
+ros2 run ros2_pubsub_bench pubsub_bench -- \
+  --mode act_cli \
+  --topic /bench_action \
+  --hz 20
+# 以 20 Hz 频率发 Fibonacci goal，统计 goals/s 与 RTT

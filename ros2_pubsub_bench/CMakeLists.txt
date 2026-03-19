@@ -9,9 +9,13 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(example_interfaces REQUIRED)
 
 add_executable(pubsub_bench src/pubsub_bench.cpp)
-ament_target_dependencies(pubsub_bench rclcpp std_msgs std_srvs)
+ament_target_dependencies(pubsub_bench rclcpp std_msgs std_srvs
+  rclcpp_action
+  example_interfaces)
 target_compile_features(pubsub_bench PUBLIC cxx_std_17)
 install(TARGETS pubsub_bench DESTINATION lib/${PROJECT_NAME})
 

@@ -1,48 +1,45 @@
-#include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/byte_multi_array.hpp>
-#include <std_srvs/srv/trigger.hpp>
-
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdio>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <example_interfaces/action/fibonacci.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <std_msgs/msg/byte_multi_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace
-{
+namespace {
 using ByteMultiArray = std_msgs::msg::ByteMultiArray;
 using Trigger = std_srvs::srv::Trigger;
+using Fibonacci = example_interfaces::action::Fibonacci;
+using GoalHandleFibonacci = rclcpp_action::ServerGoalHandle<Fibonacci>;
 constexpr size_t kHeaderSize = 16;  // 8 bytes seq + 8 bytes send_time_ns
 
-inline int64_t wall_now_ns()
-{
+inline int64_t wall_now_ns() {
   const auto now = std::chrono::system_clock::now().time_since_epoch();
   return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
-inline void write_u64(uint8_t * dst, uint64_t v)
-{
+inline void write_u64(uint8_t *dst, uint64_t v) {
   std::memcpy(dst, &v, sizeof(v));
 }
 
-inline void write_i64(uint8_t * dst, int64_t v)
-{
+inline void write_i64(uint8_t *dst, int64_t v) {
   std::memcpy(dst, &v, sizeof(v));
 }
 
-inline int64_t read_i64(const uint8_t * src)
-{
+inline int64_t read_i64(const uint8_t *src) {
   int64_t v{};
   std::memcpy(&v, src, sizeof(v));
   return v;
 }
 
-inline rclcpp::QoS make_qos(int depth, const std::string & reliability)
-{
+inline rclcpp::QoS make_qos(int depth, const std::string &reliability) {
   auto qos = rclcpp::QoS(rclcpp::KeepLast(std::max(1, depth)));
   if (reliability == "best_effort") {
     qos.best_effort();
@@ -53,25 +50,21 @@ inline rclcpp::QoS make_qos(int depth, const std::string & reliability)
 }
 }  // namespace
 
-class PubSubBenchNode final : public rclcpp::Node
-{
-public:
-  struct Config
-  {
-    std::string mode{"pub"};               // pub|sub|srv|cli
-    std::string topic{"/bench"};           // topic / service name prefix
-    int topic_count{1};                    // number of publishers/subscribers/services/clients
-    int size_bytes{1024};                  // payload size in bytes (pub)
-    double hz{100.0};                      // publish/call rate (pub/cli)
+class PubSubBenchNode final : public rclcpp::Node {
+ public:
+  struct Config {
+    std::string mode{"pub"};      // pub|sub|srv|cli|act_srv|act_cli
+    std::string topic{"/bench"};  // topic / service name prefix
+    int topic_count{1};    // number of publishers/subscribers/services/clients
+    int size_bytes{1024};  // payload size in bytes (pub)
+    double hz{100.0};      // publish/call rate (pub/cli)
     int qos_depth{10};
-    std::string reliability{"reliable"};   // reliable|best_effort
+    std::string reliability{"reliable"};  // reliable|best_effort
     int log_period_ms{1000};
   };
 
   explicit PubSubBenchNode(Config cfg)
-  : rclcpp::Node("pubsub_bench"),
-    cfg_(std::move(cfg))
-  {
+      : rclcpp::Node("pubsub_bench"), cfg_(std::move(cfg)) {
     normalize_and_validate();
     qos_ = make_qos(cfg_.qos_depth, cfg_.reliability);
 
@@ -83,25 +76,32 @@ public:
       setup_service();
     } else if (cfg_.mode == "cli") {
       setup_client();
+    } else if (cfg_.mode == "act_srv") {
+      setup_action_server();
+    } else if (cfg_.mode == "act_cli") {
+      setup_action_client();
     } else {
-      RCLCPP_FATAL(get_logger(), "Invalid mode '%s' (expected pub|sub|srv|cli)", cfg_.mode.c_str());
+      RCLCPP_FATAL(
+          get_logger(),
+          "Invalid mode '%s' (expected pub|sub|srv|cli|act_srv|act_cli)",
+          cfg_.mode.c_str());
       throw std::runtime_error("invalid mode");
     }
 
-    stats_timer_ = create_wall_timer(
-      std::chrono::milliseconds(cfg_.log_period_ms),
-      std::bind(&PubSubBenchNode::log_stats, this));
+    stats_timer_ =
+        create_wall_timer(std::chrono::milliseconds(cfg_.log_period_ms),
+                          std::bind(&PubSubBenchNode::log_stats, this));
 
-    RCLCPP_INFO(
-      get_logger(),
-      "pubsub_bench started: mode=%s topic_prefix=%s topic_count=%d size_bytes=%d hz=%.3f qos_depth=%d reliability=%s",
-      cfg_.mode.c_str(), cfg_.topic.c_str(), cfg_.topic_count, cfg_.size_bytes,
-      cfg_.hz, cfg_.qos_depth, cfg_.reliability.c_str());
+    RCLCPP_INFO(get_logger(),
+                "pubsub_bench started: mode=%s topic_prefix=%s topic_count=%d "
+                "size_bytes=%d hz=%.3f qos_depth=%d reliability=%s",
+                cfg_.mode.c_str(), cfg_.topic.c_str(), cfg_.topic_count,
+                cfg_.size_bytes, cfg_.hz, cfg_.qos_depth,
+                cfg_.reliability.c_str());
   }
 
-private:
-  void normalize_and_validate()
-  {
+ private:
+  void normalize_and_validate() {
     if (cfg_.topic.empty() || cfg_.topic[0] != '/') {
       cfg_.topic = "/" + cfg_.topic;
     }
@@ -117,15 +117,103 @@ private:
     if (cfg_.log_period_ms <= 0) {
       cfg_.log_period_ms = 1000;
     }
-    if (!(cfg_.reliability == "reliable" || cfg_.reliability == "best_effort")) {
+    if (!(cfg_.reliability == "reliable" ||
+          cfg_.reliability == "best_effort")) {
       cfg_.reliability = "reliable";
     }
   }
 
-  void setup_publisher()
-  {
+  void setup_action_server() {
+    // 使用 node 接口而不是 shared_from_this()，避免构造函数中 bad_weak_ptr
+    action_server_ = rclcpp_action::create_server<Fibonacci>(
+        this->get_node_base_interface(),
+        this->get_node_clock_interface(),
+        this->get_node_logging_interface(),
+        this->get_node_waitables_interface(),
+        cfg_.topic,
+        // goal 回调
+        [this](const rclcpp_action::GoalUUID &,
+               std::shared_ptr<const Fibonacci::Goal>) {
+          return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+        },
+        // cancel 回调
+        [this](const std::shared_ptr<GoalHandleFibonacci> /*goal_handle*/) {
+          return rclcpp_action::CancelResponse::ACCEPT;
+        },
+        // 执行回调
+        [this](const std::shared_ptr<GoalHandleFibonacci> goal_handle) {
+          const auto start_ns = wall_now_ns();
+
+          auto result = std::make_shared<Fibonacci::Result>();
+          const int n = 10;
+          result->sequence.resize(static_cast<size_t>(n));
+          if (n >= 1) result->sequence[0] = 0;
+          if (n >= 2) result->sequence[1] = 1;
+          for (int i = 2; i < n; ++i) {
+            result->sequence[static_cast<size_t>(i)] =
+                result->sequence[static_cast<size_t>(i - 1)] +
+                result->sequence[static_cast<size_t>(i - 2)];
+          }
+
+          goal_handle->succeed(result);
+
+          const int64_t end_ns = wall_now_ns();
+          const int64_t dt = end_ns - start_ns;
+          if (dt >= 0) {
+            sub_msgs_.fetch_add(1, std::memory_order_relaxed);
+            latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt),
+                                      std::memory_order_relaxed);
+            latency_cnt_.fetch_add(1, std::memory_order_relaxed);
+          }
+        });
+  }
+
+  void setup_action_client() {
+    action_client_ = rclcpp_action::create_client<Fibonacci>(
+        this->get_node_base_interface(),
+        this->get_node_graph_interface(),
+        this->get_node_logging_interface(),
+        this->get_node_waitables_interface(),
+        cfg_.topic);
+
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::duration<double>(1.0 / cfg_.hz));
+        std::chrono::duration<double>(1.0 / cfg_.hz));
+
+    action_client_timer_ = create_wall_timer(period, [this]() {
+      if (!action_client_) {
+        return;
+      }
+      if (!action_client_->wait_for_action_server(std::chrono::seconds(0))) {
+        return;
+      }
+
+      auto goal_msg = Fibonacci::Goal();
+      goal_msg.order = 10;
+
+      const int64_t start_ns = wall_now_ns();
+
+      auto send_goal_options =
+          typename rclcpp_action::Client<Fibonacci>::SendGoalOptions();
+      send_goal_options.result_callback =
+          [this, start_ns](const typename rclcpp_action::ClientGoalHandle<
+                           Fibonacci>::WrappedResult &result) {
+            (void)result;
+            const int64_t end_ns = wall_now_ns();
+            const int64_t dt = end_ns - start_ns;
+            if (dt >= 0) {
+              sub_msgs_.fetch_add(1, std::memory_order_relaxed);
+              latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt),
+                                        std::memory_order_relaxed);
+              latency_cnt_.fetch_add(1, std::memory_order_relaxed);
+            }
+          };
+
+      (void)action_client_->async_send_goal(goal_msg, send_goal_options);
+    });
+  }
+  void setup_publisher() {
+    const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.0 / cfg_.hz));
 
     pubs_.reserve(static_cast<size_t>(cfg_.topic_count));
     for (int i = 0; i < cfg_.topic_count; ++i) {
@@ -135,48 +223,41 @@ private:
       item.pub = create_publisher<ByteMultiArray>(topic_name, qos_);
       item.msg_template.data.assign(static_cast<size_t>(cfg_.size_bytes), 0xAB);
       item.timer = create_wall_timer(
-        period,
-        [this, idx = static_cast<size_t>(i)]() {
-          publish_once(idx);
-        });
+          period,
+          [this, idx = static_cast<size_t>(i)]() { publish_once(idx); });
       pubs_.push_back(std::move(item));
     }
   }
 
-  void setup_subscriber()
-  {
+  void setup_subscriber() {
     subs_.reserve(static_cast<size_t>(cfg_.topic_count));
     for (int i = 0; i < cfg_.topic_count; ++i) {
       const std::string topic_name = cfg_.topic + "_" + std::to_string(i + 1);
       auto sub = create_subscription<ByteMultiArray>(
-        topic_name,
-        qos_,
-        [this](const ByteMultiArray::SharedPtr msg) { on_msg(*msg); });
+          topic_name, qos_,
+          [this](const ByteMultiArray::SharedPtr msg) { on_msg(*msg); });
       subs_.push_back(std::move(sub));
     }
   }
 
-  void setup_service()
-  {
+  void setup_service() {
     services_.reserve(static_cast<size_t>(cfg_.topic_count));
     for (int i = 0; i < cfg_.topic_count; ++i) {
       const std::string service_name = cfg_.topic + "_" + std::to_string(i + 1);
       auto srv = create_service<Trigger>(
-        service_name,
-        [this](const std::shared_ptr<Trigger::Request>,
-               std::shared_ptr<Trigger::Response> resp) {
-          resp->success = true;
-          resp->message = "ok";
-          sub_msgs_.fetch_add(1, std::memory_order_relaxed);
-        });
+          service_name, [this](const std::shared_ptr<Trigger::Request>,
+                               std::shared_ptr<Trigger::Response> resp) {
+            resp->success = true;
+            resp->message = "ok";
+            sub_msgs_.fetch_add(1, std::memory_order_relaxed);
+          });
       services_.push_back(std::move(srv));
     }
   }
 
-  void setup_client()
-  {
+  void setup_client() {
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::duration<double>(1.0 / cfg_.hz));
+        std::chrono::duration<double>(1.0 / cfg_.hz));
 
     clients_.reserve(static_cast<size_t>(cfg_.topic_count));
     for (int i = 0; i < cfg_.topic_count; ++i) {
@@ -185,21 +266,18 @@ private:
       item.name = service_name;
       item.client = create_client<Trigger>(service_name);
       item.timer = create_wall_timer(
-        period,
-        [this, idx = static_cast<size_t>(i)]() {
-          send_request(idx);
-        });
+          period,
+          [this, idx = static_cast<size_t>(i)]() { send_request(idx); });
       clients_.push_back(std::move(item));
     }
   }
 
-  void publish_once(size_t idx)
-  {
+  void publish_once(size_t idx) {
     if (idx >= pubs_.size()) {
       return;
     }
 
-    auto & item = pubs_[idx];
+    auto &item = pubs_[idx];
     auto msg = item.msg_template;
     if (msg.data.size() >= kHeaderSize) {
       write_u64(msg.data.data(), ++item.seq);
@@ -208,31 +286,32 @@ private:
 
     item.pub->publish(std::move(msg));
     pub_msgs_.fetch_add(1, std::memory_order_relaxed);
-    pub_bytes_.fetch_add(static_cast<uint64_t>(item.msg_template.data.size()), std::memory_order_relaxed);
+    pub_bytes_.fetch_add(static_cast<uint64_t>(item.msg_template.data.size()),
+                         std::memory_order_relaxed);
   }
 
-  void on_msg(const ByteMultiArray & msg)
-  {
+  void on_msg(const ByteMultiArray &msg) {
     sub_msgs_.fetch_add(1, std::memory_order_relaxed);
-    sub_bytes_.fetch_add(static_cast<uint64_t>(msg.data.size()), std::memory_order_relaxed);
+    sub_bytes_.fetch_add(static_cast<uint64_t>(msg.data.size()),
+                         std::memory_order_relaxed);
 
     if (msg.data.size() >= kHeaderSize) {
       const int64_t send_ns = read_i64(msg.data.data() + 8);
       const int64_t now_ns = wall_now_ns();
       const int64_t dt = now_ns - send_ns;
       if (dt >= 0) {
-        latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt), std::memory_order_relaxed);
+        latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt),
+                                  std::memory_order_relaxed);
         latency_cnt_.fetch_add(1, std::memory_order_relaxed);
       }
     }
   }
 
-  void send_request(size_t idx)
-  {
+  void send_request(size_t idx) {
     if (idx >= clients_.size()) {
       return;
     }
-    auto & item = clients_[idx];
+    auto &item = clients_[idx];
     if (!item.client->wait_for_service(std::chrono::seconds(0))) {
       return;
     }
@@ -242,25 +321,24 @@ private:
     // rclcpp::Client 的回调参数是 SharedFuture，不是 Response::SharedPtr
     using TriggerClient = rclcpp::Client<Trigger>;
     (void)item.client->async_send_request(
-      req,
-      [this, start_ns](TriggerClient::SharedFuture future) {
-        try {
-          (void)future.get();
-        } catch (const std::exception &) {
-          return;
-        }
-        const int64_t now_ns = wall_now_ns();
-        const int64_t dt = now_ns - start_ns;
-        if (dt >= 0) {
-          sub_msgs_.fetch_add(1, std::memory_order_relaxed);
-          latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt), std::memory_order_relaxed);
-          latency_cnt_.fetch_add(1, std::memory_order_relaxed);
-        }
-      });
+        req, [this, start_ns](TriggerClient::SharedFuture future) {
+          try {
+            (void)future.get();
+          } catch (const std::exception &) {
+            return;
+          }
+          const int64_t now_ns = wall_now_ns();
+          const int64_t dt = now_ns - start_ns;
+          if (dt >= 0) {
+            sub_msgs_.fetch_add(1, std::memory_order_relaxed);
+            latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt),
+                                      std::memory_order_relaxed);
+            latency_cnt_.fetch_add(1, std::memory_order_relaxed);
+          }
+        });
   }
 
-  void log_stats()
-  {
+  void log_stats() {
     const auto now = std::chrono::steady_clock::now();
     const auto dt = now - last_log_time_;
     last_log_time_ = now;
@@ -271,12 +349,16 @@ private:
     }
 
     const uint64_t pub_msgs = pub_msgs_.exchange(0, std::memory_order_relaxed);
-    const uint64_t pub_bytes = pub_bytes_.exchange(0, std::memory_order_relaxed);
+    const uint64_t pub_bytes =
+        pub_bytes_.exchange(0, std::memory_order_relaxed);
     const uint64_t sub_msgs = sub_msgs_.exchange(0, std::memory_order_relaxed);
-    const uint64_t sub_bytes = sub_bytes_.exchange(0, std::memory_order_relaxed);
+    const uint64_t sub_bytes =
+        sub_bytes_.exchange(0, std::memory_order_relaxed);
 
-    const uint64_t lat_cnt = latency_cnt_.exchange(0, std::memory_order_relaxed);
-    const uint64_t lat_sum = latency_sum_ns_.exchange(0, std::memory_order_relaxed);
+    const uint64_t lat_cnt =
+        latency_cnt_.exchange(0, std::memory_order_relaxed);
+    const uint64_t lat_sum =
+        latency_sum_ns_.exchange(0, std::memory_order_relaxed);
 
     const double pub_mps = pub_msgs / sec;
     const double pub_mbps = (pub_bytes * 8.0) / (sec * 1e6);
@@ -284,35 +366,29 @@ private:
     const double sub_mbps = (sub_bytes * 8.0) / (sec * 1e6);
 
     if (cfg_.mode == "pub") {
-      RCLCPP_INFO(
-        get_logger(),
-        "stats(%.2fs): pub %.1f msg/s %.1f Mb/s",
-        sec, pub_mps, pub_mbps);
+      RCLCPP_INFO(get_logger(), "stats(%.2fs): pub %.1f msg/s %.1f Mb/s", sec,
+                  pub_mps, pub_mbps);
       return;
     }
 
     if (cfg_.mode == "sub") {
       if (lat_cnt > 0) {
         const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
-        RCLCPP_INFO(
-          get_logger(),
-          "stats(%.2fs): sub %.1f msg/s %.1f Mb/s | latency avg %.3f ms (n=%lu)",
-          sec, sub_mps, sub_mbps, avg_ms, static_cast<unsigned long>(lat_cnt));
+        RCLCPP_INFO(get_logger(),
+                    "stats(%.2fs): sub %.1f msg/s %.1f Mb/s | latency avg %.3f "
+                    "ms (n=%lu)",
+                    sec, sub_mps, sub_mbps, avg_ms,
+                    static_cast<unsigned long>(lat_cnt));
       } else {
-        RCLCPP_INFO(
-          get_logger(),
-          "stats(%.2fs): sub %.1f msg/s %.1f Mb/s",
-          sec, sub_mps, sub_mbps);
+        RCLCPP_INFO(get_logger(), "stats(%.2fs): sub %.1f msg/s %.1f Mb/s", sec,
+                    sub_mps, sub_mbps);
       }
       return;
     }
 
     if (cfg_.mode == "srv") {
       // service server：统计每秒请求数
-      RCLCPP_INFO(
-        get_logger(),
-        "stats(%.2fs): srv %.1f req/s",
-        sec, sub_mps);
+      RCLCPP_INFO(get_logger(), "stats(%.2fs): srv %.1f req/s", sec, sub_mps);
       return;
     }
 
@@ -320,15 +396,41 @@ private:
       // client：统计调用速率和 RTT
       if (lat_cnt > 0) {
         const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
-        RCLCPP_INFO(
-          get_logger(),
-          "stats(%.2fs): cli %.1f calls/s | RTT avg %.3f ms (n=%lu)",
-          sec, sub_mps, avg_ms, static_cast<unsigned long>(lat_cnt));
+        RCLCPP_INFO(get_logger(),
+                    "stats(%.2fs): cli %.1f calls/s | RTT avg %.3f ms (n=%lu)",
+                    sec, sub_mps, avg_ms, static_cast<unsigned long>(lat_cnt));
       } else {
+        RCLCPP_INFO(get_logger(), "stats(%.2fs): cli %.1f calls/s", sec,
+                    sub_mps);
+      }
+      return;
+    }
+
+    if (cfg_.mode == "act_srv") {
+      // 使用 sub_mps 作为完成的 goal/s
+      if (lat_cnt > 0) {
+        const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
         RCLCPP_INFO(
-          get_logger(),
-          "stats(%.2fs): cli %.1f calls/s",
-          sec, sub_mps);
+            get_logger(),
+            "stats(%.2fs): act_srv %.1f goals/s | handle avg %.3f ms (n=%lu)",
+            sec, sub_mps, avg_ms, static_cast<unsigned long>(lat_cnt));
+      } else {
+        RCLCPP_INFO(get_logger(), "stats(%.2fs): act_srv %.1f goals/s", sec,
+                    sub_mps);
+      }
+      return;
+    }
+
+    if (cfg_.mode == "act_cli") {
+      if (lat_cnt > 0) {
+        const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
+        RCLCPP_INFO(
+            get_logger(),
+            "stats(%.2fs): act_cli %.1f goals/s | RTT avg %.3f ms (n=%lu)", sec,
+            sub_mps, avg_ms, static_cast<unsigned long>(lat_cnt));
+      } else {
+        RCLCPP_INFO(get_logger(), "stats(%.2fs): act_cli %.1f goals/s", sec,
+                    sub_mps);
       }
       return;
     }
@@ -339,9 +441,11 @@ private:
 
   std::vector<rclcpp::Subscription<ByteMultiArray>::SharedPtr> subs_;
   rclcpp::TimerBase::SharedPtr stats_timer_;
+  rclcpp_action::Server<Fibonacci>::SharedPtr action_server_;
+  rclcpp_action::Client<Fibonacci>::SharedPtr action_client_;
+  rclcpp::TimerBase::SharedPtr action_client_timer_;
 
-  struct PubItem
-  {
+  struct PubItem {
     std::string topic;
     rclcpp::Publisher<ByteMultiArray>::SharedPtr pub;
     rclcpp::TimerBase::SharedPtr timer;
@@ -351,15 +455,15 @@ private:
   std::vector<PubItem> pubs_;
   std::vector<rclcpp::Service<Trigger>::SharedPtr> services_;
 
-  struct ClientItem
-  {
+  struct ClientItem {
     std::string name;
     rclcpp::Client<Trigger>::SharedPtr client;
     rclcpp::TimerBase::SharedPtr timer;
   };
   std::vector<ClientItem> clients_;
 
-  std::chrono::steady_clock::time_point last_log_time_{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point last_log_time_{
+      std::chrono::steady_clock::now()};
 
   std::atomic<uint64_t> pub_msgs_{0};
   std::atomic<uint64_t> pub_bytes_{0};
@@ -369,53 +473,55 @@ private:
   std::atomic<uint64_t> latency_sum_ns_{0};
 };
 
-namespace
-{
-void print_usage()
-{
+namespace {
+void print_usage() {
   std::fprintf(
-    stderr,
-    "Usage:\n"
-    "  pubsub_bench [--mode pub|sub|srv|cli] --topic <name> [--topic-count <n>] [--size <bytes>] [--hz <rate>] [--qos-depth <n>] [--reliability reliable|best_effort] [--log-ms <ms>] [--ros-args ...]\n"
-    "\n"
-    "Examples:\n"
-    "  # publisher\n"
-    "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode pub --topic /chatter --size 1048576 --hz 100\n"
-    "  # subscriber\n"
-    "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode sub --topic /chatter\n"
-    "  # service server\n"
-    "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode srv --topic /bench_srv\n"
-    "  # service client\n"
-    "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode cli --topic /bench_srv --hz 50\n"
-    "\n");
+      stderr,
+      "Usage:\n"
+      "  pubsub_bench [--mode pub|sub|srv|cli] --topic <name> [--topic-count "
+      "<n>] [--size <bytes>] [--hz <rate>] [--qos-depth <n>] [--reliability "
+      "reliable|best_effort] [--log-ms <ms>] [--ros-args ...]\n"
+      "\n"
+      "Examples:\n"
+      "  # publisher\n"
+      "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode pub --topic "
+      "/chatter --size 1048576 --hz 100\n"
+      "  # subscriber\n"
+      "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode sub --topic "
+      "/chatter\n"
+      "  # service server\n"
+      "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode srv --topic "
+      "/bench_srv\n"
+      "  # service client\n"
+      "  ros2 run ros2_pubsub_bench pubsub_bench -- --mode cli --topic "
+      "/bench_srv --hz 50\n"
+      "\n");
 }
 
-bool starts_with(const std::string & s, const char * prefix)
-{
+bool starts_with(const std::string &s, const char *prefix) {
   return s.rfind(prefix, 0) == 0;
 }
 
-PubSubBenchNode::Config parse_cli(int argc, char ** argv)
-{
+PubSubBenchNode::Config parse_cli(int argc, char **argv) {
   PubSubBenchNode::Config cfg;
 
   // Remove ROS-specific args first, so our parser sees only user args.
   const auto non_ros = rclcpp::remove_ros_arguments(argc, argv);
   std::vector<std::string> args;
   args.reserve(non_ros.size());
-  for (const auto & a : non_ros) {
+  for (const auto &a : non_ros) {
     args.push_back(a);
   }
 
   // args[0] is program name
   for (size_t i = 1; i < args.size(); ++i) {
-    const std::string & a = args[i];
+    const std::string &a = args[i];
     if (a == "-h" || a == "--help") {
       print_usage();
       std::exit(0);
     }
 
-    auto need_value = [&](const char * flag) -> const std::string & {
+    auto need_value = [&](const char *flag) -> const std::string & {
       if (i + 1 >= args.size()) {
         throw std::runtime_error(std::string("missing value for ") + flag);
       }
@@ -449,13 +555,12 @@ PubSubBenchNode::Config parse_cli(int argc, char ** argv)
 }
 }  // namespace
 
-int main(int argc, char ** argv)
-{
+int main(int argc, char **argv) {
   rclcpp::init(argc, argv);
   PubSubBenchNode::Config cfg;
   try {
     cfg = parse_cli(argc, argv);
-  } catch (const std::exception & e) {
+  } catch (const std::exception &e) {
     std::fprintf(stderr, "Error: %s\n\n", e.what());
     print_usage();
     rclcpp::shutdown();
