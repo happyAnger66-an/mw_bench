@@ -22,6 +22,12 @@ inline int64_t steady_now_ns()
   return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
 }
 
+inline int64_t wall_now_ns()
+{
+  const auto now = std::chrono::system_clock::now().time_since_epoch();
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+}
+
 inline void write_u64(uint8_t * dst, uint64_t v)
 {
   std::memcpy(dst, &v, sizeof(v));
@@ -135,7 +141,7 @@ private:
     auto msg = msg_template_;
     if (msg.data.size() >= kHeaderSize) {
       write_u64(msg.data.data(), ++seq_);
-      write_i64(msg.data.data() + 8, steady_now_ns());
+      write_i64(msg.data.data() + 8, wall_now_ns());
     }
 
     pub_->publish(std::move(msg));
@@ -150,7 +156,7 @@ private:
 
     if (msg.data.size() >= kHeaderSize) {
       const int64_t send_ns = read_i64(msg.data.data() + 8);
-      const int64_t now_ns = steady_now_ns();
+      const int64_t now_ns = wall_now_ns();
       const int64_t dt = now_ns - send_ns;
       if (dt >= 0) {
         latency_sum_ns_.fetch_add(static_cast<uint64_t>(dt), std::memory_order_relaxed);
@@ -183,17 +189,26 @@ private:
     const double sub_mps = sub_msgs / sec;
     const double sub_mbps = (sub_bytes * 8.0) / (sec * 1e6);
 
+    if (cfg_.mode == "pub") {
+      RCLCPP_INFO(
+        get_logger(),
+        "stats(%.2fs): pub %.1f msg/s %.1f Mb/s",
+        sec, pub_mps, pub_mbps);
+      return;
+    }
+
+    // sub mode
     if (lat_cnt > 0) {
       const double avg_ms = (lat_sum / static_cast<double>(lat_cnt)) / 1e6;
       RCLCPP_INFO(
         get_logger(),
-        "stats(%.2fs): pub %.1f msg/s %.1f Mb/s | sub %.1f msg/s %.1f Mb/s | latency avg %.3f ms (n=%lu)",
-        sec, pub_mps, pub_mbps, sub_mps, sub_mbps, avg_ms, static_cast<unsigned long>(lat_cnt));
+        "stats(%.2fs): sub %.1f msg/s %.1f Mb/s | latency avg %.3f ms (n=%lu)",
+        sec, sub_mps, sub_mbps, avg_ms, static_cast<unsigned long>(lat_cnt));
     } else {
       RCLCPP_INFO(
         get_logger(),
-        "stats(%.2fs): pub %.1f msg/s %.1f Mb/s | sub %.1f msg/s %.1f Mb/s",
-        sec, pub_mps, pub_mbps, sub_mps, sub_mbps);
+        "stats(%.2fs): sub %.1f msg/s %.1f Mb/s",
+        sec, sub_mps, sub_mbps);
     }
   }
 
