@@ -64,6 +64,7 @@ public:
   {
     std::string mode{"pub"};               // pub|sub
     std::string topic{"/bench"};           // topic name
+    int topic_count{1};                    // number of publishers in pub mode
     int size_bytes{1024};                  // payload size in bytes (pub)
     double hz{100.0};                      // publish rate (pub)
     int qos_depth{10};
@@ -103,6 +104,9 @@ private:
     if (cfg_.topic.empty() || cfg_.topic[0] != '/') {
       cfg_.topic = "/" + cfg_.topic;
     }
+    if (cfg_.topic_count <= 0) {
+      cfg_.topic_count = 1;
+    }
     if (cfg_.size_bytes < 0) {
       cfg_.size_bytes = 0;
     }
@@ -119,34 +123,54 @@ private:
 
   void setup_publisher()
   {
-    pub_ = create_publisher<ByteMultiArray>(cfg_.topic, qos_);
-    msg_template_.data.assign(static_cast<size_t>(cfg_.size_bytes), 0xAB);
-
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>(1.0 / cfg_.hz));
 
-    pub_timer_ = create_wall_timer(period, std::bind(&PubSubBenchNode::publish_once, this));
+    pubs_.reserve(static_cast<size_t>(cfg_.topic_count));
+    for (int i = 0; i < cfg_.topic_count; ++i) {
+      const std::string topic_name = cfg_.topic + "_" + std::to_string(i + 1);
+      PubItem item;
+      item.topic = topic_name;
+      item.pub = create_publisher<ByteMultiArray>(topic_name, qos_);
+      item.msg_template.data.assign(static_cast<size_t>(cfg_.size_bytes), 0xAB);
+      item.timer = create_wall_timer(
+        period,
+        [this, idx = static_cast<size_t>(i)]() {
+          publish_once(idx);
+        });
+      pubs_.push_back(std::move(item));
+    }
   }
 
   void setup_subscriber()
   {
-    sub_ = create_subscription<ByteMultiArray>(
-      cfg_.topic,
-      qos_,
-      [this](const ByteMultiArray::SharedPtr msg) { on_msg(*msg); });
+    subs_.reserve(static_cast<size_t>(cfg_.topic_count));
+    for (int i = 0; i < cfg_.topic_count; ++i) {
+      const std::string topic_name = cfg_.topic + "_" + std::to_string(i + 1);
+      auto sub = create_subscription<ByteMultiArray>(
+        topic_name,
+        qos_,
+        [this](const ByteMultiArray::SharedPtr msg) { on_msg(*msg); });
+      subs_.push_back(std::move(sub));
+    }
   }
 
-  void publish_once()
+  void publish_once(size_t idx)
   {
-    auto msg = msg_template_;
+    if (idx >= pubs_.size()) {
+      return;
+    }
+
+    auto & item = pubs_[idx];
+    auto msg = item.msg_template;
     if (msg.data.size() >= kHeaderSize) {
-      write_u64(msg.data.data(), ++seq_);
+      write_u64(msg.data.data(), ++item.seq);
       write_i64(msg.data.data() + 8, wall_now_ns());
     }
 
-    pub_->publish(std::move(msg));
+    item.pub->publish(std::move(msg));
     pub_msgs_.fetch_add(1, std::memory_order_relaxed);
-    pub_bytes_.fetch_add(static_cast<uint64_t>(msg_template_.data.size()), std::memory_order_relaxed);
+    pub_bytes_.fetch_add(static_cast<uint64_t>(item.msg_template.data.size()), std::memory_order_relaxed);
   }
 
   void on_msg(const ByteMultiArray & msg)
@@ -215,13 +239,18 @@ private:
   Config cfg_;
   rclcpp::QoS qos_{10};
 
-  rclcpp::Publisher<ByteMultiArray>::SharedPtr pub_;
-  rclcpp::Subscription<ByteMultiArray>::SharedPtr sub_;
-  rclcpp::TimerBase::SharedPtr pub_timer_;
+  std::vector<rclcpp::Subscription<ByteMultiArray>::SharedPtr> subs_;
   rclcpp::TimerBase::SharedPtr stats_timer_;
 
-  ByteMultiArray msg_template_;
-  uint64_t seq_{0};
+  struct PubItem
+  {
+    std::string topic;
+    rclcpp::Publisher<ByteMultiArray>::SharedPtr pub;
+    rclcpp::TimerBase::SharedPtr timer;
+    ByteMultiArray msg_template;
+    uint64_t seq{0};
+  };
+  std::vector<PubItem> pubs_;
 
   std::chrono::steady_clock::time_point last_log_time_{std::chrono::steady_clock::now()};
 
@@ -240,7 +269,7 @@ void print_usage()
   std::fprintf(
     stderr,
     "Usage:\n"
-    "  pubsub_bench [--mode pub|sub] --topic <name> [--size <bytes>] [--hz <rate>] [--qos-depth <n>] [--reliability reliable|best_effort] [--log-ms <ms>] [--ros-args ...]\n"
+    "  pubsub_bench [--mode pub|sub] --topic <name> [--topic-count <n>] [--size <bytes>] [--hz <rate>] [--qos-depth <n>] [--reliability reliable|best_effort] [--log-ms <ms>] [--ros-args ...]\n"
     "\n"
     "Examples:\n"
     "  # publisher\n"
@@ -286,6 +315,8 @@ PubSubBenchNode::Config parse_cli(int argc, char ** argv)
       cfg.mode = need_value("--mode");
     } else if (a == "--topic") {
       cfg.topic = need_value("--topic");
+    } else if (a == "--topic-count") {
+      cfg.topic_count = std::stoi(need_value("--topic-count"));
     } else if (a == "--size" || a == "--size-bytes") {
       cfg.size_bytes = std::stoi(need_value(a.c_str()));
     } else if (a == "--hz") {

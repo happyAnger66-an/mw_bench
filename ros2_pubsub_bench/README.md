@@ -3,6 +3,9 @@
 一个简单的 C++ ROS 2 pub/sub 压测节点，支持通过**命令行**指定：
 
 - **topic name**：`--topic /xxx`
+- **publisher / subscriber 数量**：`--topic-count 4`
+  - pub 模式：产生 publisher 到 `xxx_1` ~ `xxx_4`
+  - sub 模式：订阅 `xxx_1` ~ `xxx_4`
 - **topic size(bytes)**（仅 pub 生效）：`--size 1048576`
 - **topic hz**（仅 pub 生效）：`--hz 100`
 
@@ -24,6 +27,7 @@ source install/setup.bash
 ros2 run ros2_pubsub_bench pubsub_bench -- \
   --mode pub \
   --topic /chatter \
+  --topic-count 4 \
   --size 1048576 \
   --hz 100
 ```
@@ -33,7 +37,8 @@ ros2 run ros2_pubsub_bench pubsub_bench -- \
 ```bash
 ros2 run ros2_pubsub_bench pubsub_bench -- \
   --mode sub \
-  --topic /chatter
+  --topic /chatter \
+  --topic-count 4
 ```
 
 ## 输出说明
